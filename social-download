@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+DEFAULT_DATA = Path.home() / "Library/Application Support/SocialDownload"
+DATA = Path(os.environ.get("SOCIAL_DOWNLOAD_DIR", DEFAULT_DATA)).expanduser().resolve()
+PROFILES = DATA / "profiles.txt"
+LABEL = "local.social-download"
+AGENT = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+
+
+def parse_url(url):
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        raise ValueError(f"Cần link HTTPS của TikTok hoặc Instagram. Link nhận được {url}")
+    for domain, platform in (("tiktok.com", "tiktok"), ("instagram.com", "instagram")):
+        if host == domain or host.endswith(f".{domain}"):
+            return platform, parsed.path.rstrip("/")
+    raise ValueError(f"Link không thuộc TikTok hoặc Instagram. Link nhận được {url}")
+
+
+def profile_url(url):
+    platform, path = parse_url(url)
+    if platform == "tiktok" and re.fullmatch(r"/@[a-zA-Z0-9_.-]+", path):
+        return f"https://www.tiktok.com{path}"
+    if platform == "instagram":
+        match = re.fullmatch(r"/([a-zA-Z0-9_.]+)(?:/reels)?", path)
+        if match and match[1].lower() not in {"accounts", "direct", "explore", "p", "reel", "reels", "stories", "tv"}:
+            return f"https://www.instagram.com/{match[1]}/reels/"
+    raise ValueError(f"Cần link profile. Link nhận được {url}")
+
+
+def profiles():
+    if not PROFILES.exists():
+        return []
+    lines = (line.strip() for line in PROFILES.read_text(encoding="utf-8").splitlines())
+    return list(dict.fromkeys(profile_url(line) for line in lines if line and not line.startswith("#")))
+
+
+def download(urls, polling=False):
+    targets = [(url, parse_url(url)[0]) for url in urls]
+    DATA.mkdir(parents=True, exist_ok=True)
+    videos = DATA / "videos"
+    with (DATA / "run.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Một lượt tải khác đang chạy. Bỏ qua lượt này.")
+            return 0 if polling else 1
+
+        failed = False
+        for url, platform in targets:
+            if polling and platform == "instagram":
+                command = [
+                    "gallery-dl", "--download-archive", str(DATA / "instagram-archive.sqlite3"),
+                    "--sleep-request", "1", "--filter", "extension in ('mp4', 'webm', 'mov', 'mkv', 'm4v')",
+                    "-d", str(videos / "instagram"),
+                ]
+            else:
+                command = [
+                    "yt-dlp", "--download-archive", str(DATA / f"{platform}-archive.txt"),
+                    "--sleep-requests", "1", "--sleep-interval", "2", "-P", str(videos / platform),
+                ]
+            print(f"Đang kiểm tra {url}", flush=True)
+            try:
+                result = subprocess.run([*command, "--", url])
+            except FileNotFoundError:
+                print(f"Thiếu {command[0]}. Cài bằng brew install {command[0]}.", file=sys.stderr)
+                failed = True
+                continue
+            if result.returncode:
+                failed = True
+                print(f"Lượt tải lỗi (mã {result.returncode}). Xem thông báo phía trên.", file=sys.stderr)
+        return int(failed)
+
+
+def schedule(minutes):
+    domain = f"gui/{os.getuid()}"
+    service = f"{domain}/{LABEL}"
+    loaded = subprocess.run(["launchctl", "print", service], capture_output=True).returncode == 0
+    if loaded:
+        subprocess.run(["launchctl", "bootout", service], check=True)
+    if minutes is None:
+        AGENT.unlink(missing_ok=True)
+        print("Đã tắt lịch tự tải.")
+        return
+
+    AGENT.parent.mkdir(parents=True, exist_ok=True)
+    runner = DATA / "runner.py"
+    if Path(__file__).resolve() != runner:
+        shutil.copyfile(__file__, runner)
+    with AGENT.open("wb") as file:
+        plistlib.dump({
+            "Label": LABEL,
+            "ProgramArguments": [sys.executable, str(runner), "sync"],
+            "StartInterval": minutes * 60,
+            "EnvironmentVariables": {
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+                "SOCIAL_DOWNLOAD_DIR": str(DATA),
+            },
+            "StandardOutPath": str(DATA / "sync.log"),
+            "StandardErrorPath": str(DATA / "sync.log"),
+        }, file)
+    subprocess.run(["launchctl", "bootstrap", domain, str(AGENT)], check=True)
+    print(f"Đã bật lịch mỗi {minutes} phút. Nhật ký tại {DATA / 'sync.log'}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Tải clip TikTok và Instagram trên Mac.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("download", help="Tải clip theo link").add_argument("urls", nargs="+")
+    commands.add_parser("watch", help="Thêm profile để theo dõi").add_argument("urls", nargs="+")
+    commands.add_parser("sync", help="Quét các profile đã lưu")
+    commands.add_parser("schedule", help="Bật lịch tự tải").add_argument("--minutes", type=int, default=60)
+    commands.add_parser("unschedule", help="Tắt lịch tự tải")
+    args = parser.parse_args()
+
+    try:
+        if args.command == "download":
+            return download(args.urls)
+        if args.command == "watch":
+            requested = dict.fromkeys(profile_url(url) for url in args.urls)
+            DATA.mkdir(parents=True, exist_ok=True)
+            with PROFILES.open("a", encoding="utf-8") as file:
+                fcntl.flock(file, fcntl.LOCK_EX)
+                existing = set(profiles())
+                new = [url for url in requested if url not in existing]
+                if new:
+                    file.write("\n" + "\n".join(new) + "\n")
+            print(f"Đang theo dõi {len(existing) + len(new)} profile. Danh sách tại {PROFILES}")
+        elif args.command == "unschedule":
+            schedule(None)
+        else:
+            urls = profiles()
+            if not urls:
+                raise ValueError("Chưa có profile. Dùng lệnh watch để thêm.")
+            if args.command == "sync":
+                return download(urls, polling=True)
+            if args.minutes <= 0:
+                raise ValueError("Khoảng cách giữa các lượt phải lớn hơn 0 phút.")
+            schedule(args.minutes)
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
